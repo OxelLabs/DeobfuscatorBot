@@ -1,16 +1,16 @@
 services:
   - type: web
     name: zip-deobfuscator-bot
-    runtime: python
-    pythonVersion: "3.11.9"
+    runtime: docker
     plan: free
-    buildCommand: |
-      apt-get update && apt-get install -y nodejs npm && \
-      npm install -g javascript-obfuscator @javascript-obfuscator/cli deobfuscator @relative/synchrony && \
-      pip install -r requirements.txt
-    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: MAX_ZIP_MB
         value: "50"
+      - key: FILE_TIMEOUT_SECONDS
+        value: "18"
+      - key: TOTAL_JOB_TIMEOUT_SECONDS
+        value: "900"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"

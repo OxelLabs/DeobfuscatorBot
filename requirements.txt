@@ -1,4 +1,4 @@
 aiogram==3.13.1
 aiohttp==3.10.11
-jsbeautifier
-chardet
+jsbeautifier==1.15.1
+chardet==5.2.0
