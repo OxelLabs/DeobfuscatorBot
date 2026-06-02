@@ -1,39 +1,50 @@
 import asyncio
 import base64
-import codecs
 import hashlib
 import html
 import io
-import json
 import logging
+import marshal
 import os
 import re
+import subprocess
+import sys
+import tempfile
+import time
 import urllib.parse
 import zipfile
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List, Dict, Any
 
+import chardet
+import jsbeautifier
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatAction
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardMarkup,
     Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BufferedInputFile,
+    Document,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("zipbot")
 
-TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 MAX_ZIP_MB = int(os.environ.get("MAX_ZIP_MB", "50"))
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
-pending_jobs: dict[str, bytes] = {}
+MAX_ZIP_BYTES = MAX_ZIP_MB * 1024 * 1024
+PORT = int(os.environ.get("PORT", "8080"))
+MAX_PASSES = 20
+SUBPROC_TIMEOUT = 15
+JSFUCK_TIMEOUT = 10
+BF_MAX_STEPS = 1_000_000
 
 BINARY_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico",
@@ -44,589 +55,1052 @@ BINARY_EXTS = {
     ".psd", ".ai", ".sketch",
 }
 
+JS_EXTS = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}
+PY_EXTS = {".py", ".pyw"}
+PHP_EXTS = {".php", ".phtml", ".php5", ".php7"}
 
-def safe_decode(data: bytes) -> Optional[str]:
-    for enc in ("utf-8", "latin-1", "cp1252"):
-        try:
-            return data.decode(enc)
-        except Exception:
-            pass
-    return None
+CODE_KEYWORDS = [
+    "function", "const ", "var ", "let ", "return", "import", "export",
+    "class ", "def ", "print", "require", "module", "if ", "for ", "while ",
+    "async", "await", " the ", " and ", "this", "that",
+]
 
 
 def is_printable_text(data: bytes) -> bool:
-    if len(data) == 0:
+    if not data:
         return False
     sample = data[:8192]
     try:
         text = sample.decode("utf-8")
-    except Exception:
-        return False
-    non_printable = sum(1 for c in text if ord(c) < 32 and c not in "\n\r\t")
-    return non_printable / max(len(text), 1) < 0.05
+    except UnicodeDecodeError:
+        try:
+            det = chardet.detect(sample)
+            enc = det.get("encoding") or "latin-1"
+            text = sample.decode(enc, errors="replace")
+        except Exception:
+            return False
+    bad = sum(1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t\f\b")
+    return (bad / max(len(text), 1)) <= 0.05
+
+
+def _to_text(data: bytes) -> Optional[str]:
+    if not data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            det = chardet.detect(data[:16384])
+            enc = det.get("encoding") or "utf-8"
+            return data.decode(enc, errors="replace")
+        except Exception:
+            return None
 
 
 def _b64_decode_safe(s: str) -> Optional[bytes]:
-    s = re.sub(r"[\s\r\n]+", "", s)
-    if not re.fullmatch(r"[A-Za-z0-9+/=]+", s):
+    s2 = re.sub(r"\s+", "", s)
+    if len(s2) < 16:
         return None
-    if len(s) < 16:
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", s2):
         return None
-    pad = s + "=" * ((-len(s)) % 4)
+    pad = (-len(s2)) % 4
+    s2 = s2 + ("=" * pad)
     try:
-        return base64.b64decode(pad)
+        return base64.b64decode(s2, validate=False)
     except Exception:
         return None
-
-
-def detect_and_decode(data: bytes, filename: str) -> tuple[bytes, list[str]]:
-    methods_applied = []
-    current = data
-    seen = set()
-    for _ in range(20):
-        h = hashlib.md5(current).hexdigest()
-        if h in seen:
-            break
-        seen.add(h)
-        result, method = _single_pass(current, filename)
-        if method is None:
-            break
-        methods_applied.append(method)
-        current = result
-    return current, methods_applied
-
-
-def _single_pass(data: bytes, filename: str) -> tuple[bytes, Optional[str]]:
-    text = safe_decode(data)
-
-    if text is not None:
-        r = _try_js_eval_unwrap(text)
-        if r is not None:
-            return r, "js_eval_unwrap"
-
-    if text is not None:
-        r = _try_any_base64(text)
-        if r is not None:
-            return r, "base64"
-
-    if text is not None:
-        r = _try_hex(text)
-        if r is not None:
-            return r, "hex"
-
-    if text is not None:
-        r = _try_uri_encoding(text)
-        if r is not None:
-            return r, "uri_encoded"
-
-    if text is not None:
-        r = _try_html_entities(text)
-        if r is not None:
-            return r, "html_entities"
-
-    if text is not None:
-        r = _try_unicode_escapes(text)
-        if r is not None:
-            return r, "unicode_escapes"
-
-    if text is not None:
-        r = _try_js_string_escape(text)
-        if r is not None:
-            return r, "js_string_escape"
-
-    if text is not None:
-        r = _try_json_base64_values(text)
-        if r is not None:
-            return r, "json_base64_values"
-
-    if text is not None:
-        r = _try_octal_escape(text)
-        if r is not None:
-            return r, "octal_escape"
-
-    if text is not None:
-        r = _try_rot13(text)
-        if r is not None:
-            return r, "rot13"
-
-    return data, None
-
-
-def _try_js_eval_unwrap(text: str) -> Optional[bytes]:
-    patterns = [
-        r'(?:let|var|const)\s+\w+\s*=\s*["\'\`]([A-Za-z0-9+/=\r\n]{40,})["\'\`]',
-        r'(?:eval|exec)\s*\(\s*(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
-        r'atob\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
-        r'Buffer\.from\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\'],\s*["\']base64["\']\s*\)',
-        r'(?:fromBase64|b64decode|decodeBase64)\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
-        r'_0x[0-9a-f]+\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, text, re.DOTALL | re.IGNORECASE):
-            decoded = _b64_decode_safe(m.group(1))
-            if decoded is not None and is_printable_text(decoded):
-                return decoded
-    return None
-
-
-def _try_any_base64(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-
-    clean = re.sub(r"[\s\r\n]+", "", stripped)
-    if len(clean) >= 16 and re.fullmatch(r"[A-Za-z0-9+/=]+", clean):
-        decoded = _b64_decode_safe(clean)
-        if decoded is not None and is_printable_text(decoded):
-            return decoded
-
-    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
-    if len(lines) >= 2:
-        joined = "".join(lines)
-        if re.fullmatch(r"[A-Za-z0-9+/=]+", joined):
-            decoded = _b64_decode_safe(joined)
-            if decoded is not None and is_printable_text(decoded):
-                return decoded
-
-    chunks = re.findall(r"[A-Za-z0-9+/]{60,}={0,2}", stripped)
-    if chunks:
-        combined = "".join(chunks)
-        decoded = _b64_decode_safe(combined)
-        if decoded is not None and is_printable_text(decoded):
-            return decoded
-
-    return None
-
-
-def _try_hex(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-    clean = re.sub(r"[\s\r\n]+", "", stripped)
-    clean = re.sub(r"^0x", "", clean, flags=re.IGNORECASE)
-    if len(clean) >= 20 and len(clean) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", clean):
-        try:
-            decoded = bytes.fromhex(clean)
-            if is_printable_text(decoded):
-                return decoded
-        except Exception:
-            pass
-
-    if re.search(r"(?:\\x[0-9a-fA-F]{2}){3,}", stripped):
-        try:
-            result = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), stripped)
-            if is_printable_text(result.encode("utf-8")):
-                return result.encode("utf-8")
-        except Exception:
-            pass
-
-    return None
-
-
-def _try_uri_encoding(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-    if stripped.count("%") < 5:
-        return None
-    total = len(stripped.replace(" ", "").replace("\n", ""))
-    if stripped.count("%") / max(total, 1) < 0.05:
-        return None
-    try:
-        decoded = urllib.parse.unquote(stripped, errors="strict")
-        if decoded != stripped and is_printable_text(decoded.encode("utf-8")):
-            return decoded.encode("utf-8")
-    except Exception:
-        pass
-    try:
-        decoded = urllib.parse.unquote_plus(stripped)
-        if decoded != stripped and is_printable_text(decoded.encode("utf-8")):
-            return decoded.encode("utf-8")
-    except Exception:
-        pass
-    return None
-
-
-def _try_html_entities(text: str) -> Optional[bytes]:
-    if "&" not in text or ";" not in text:
-        return None
-    if len(re.findall(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);", text)) < 3:
-        return None
-    decoded = html.unescape(text)
-    if decoded != text:
-        return decoded.encode("utf-8")
-    return None
 
 
 def _looks_like_code(text: str) -> bool:
-    keywords = ["function", "const", "var", "let", "return", "import", "export",
-                 "class", "def ", "print", "require", "module", "if ", "for ",
-                 "while", "async", "await", "the ", "and ", "this", "that"]
-    lower = text.lower()
-    return sum(1 for kw in keywords if kw in lower) >= 2
+    if not text:
+        return False
+    low = text.lower()
+    hits = sum(1 for k in CODE_KEYWORDS if k in low)
+    return hits >= 2
 
 
-def _try_rot13(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-    if len(stripped) < 20 or not re.search(r"[a-zA-Z]", stripped):
+def _md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _run_subproc(cmd: List[str], input_bytes: Optional[bytes] = None, timeout: int = SUBPROC_TIMEOUT) -> Optional[bytes]:
+    try:
+        r = subprocess.run(
+            cmd,
+            input=input_bytes,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        if r.returncode != 0:
+            log.debug("subproc rc=%s stderr=%s", r.returncode, r.stderr[:300])
+            return None
+        return r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log.debug("subproc fail %s: %s", cmd[0], e)
         return None
-    decoded = codecs.decode(stripped, "rot_13")
-    if _looks_like_code(decoded) and not _looks_like_code(stripped):
-        return decoded.encode("utf-8")
+
+
+def _js_beautify(text: str) -> str:
+    try:
+        opts = jsbeautifier.default_options()
+        opts.indent_size = 2
+        opts.space_in_empty_paren = True
+        return jsbeautifier.beautify(text, opts)
+    except Exception:
+        return text
+
+
+def _try_synchrony(text: str) -> Optional[str]:
+    fin = tempfile.NamedTemporaryFile(suffix=".js", delete=False)
+    fout_path = fin.name + ".out.js"
+    try:
+        fin.write(text.encode("utf-8"))
+        fin.close()
+        for cmd in (
+            ["synchrony", "deobfuscate", fin.name, "-o", fout_path],
+            ["npx", "--yes", "synchrony", "deobfuscate", fin.name, "-o", fout_path],
+        ):
+            out = _run_subproc(cmd, timeout=SUBPROC_TIMEOUT)
+            if out is not None and os.path.exists(fout_path):
+                try:
+                    with open(fout_path, "rb") as f:
+                        data = f.read()
+                    if data and data != text.encode("utf-8"):
+                        return data.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+        for cmd in (
+            ["deobfuscator", "-s", fin.name, "-o", fout_path],
+            ["npx", "--yes", "deobfuscator", "-s", fin.name, "-o", fout_path],
+        ):
+            out = _run_subproc(cmd, timeout=SUBPROC_TIMEOUT)
+            if out is not None and os.path.exists(fout_path):
+                try:
+                    with open(fout_path, "rb") as f:
+                        data = f.read()
+                    if data and data != text.encode("utf-8"):
+                        return data.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+        return None
+    finally:
+        for p in (fin.name, fout_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _try_js_0x_fallback(text: str) -> Optional[str]:
+    m = re.search(r"(var|let|const)\s+(_0x[a-f0-9]+)\s*=\s*(\[[^\]]+\])\s*;", text)
+    if not m:
+        return None
+    arr_name = m.group(2)
+    arr_literal = m.group(3)
+    try:
+        items = re.findall(r"(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\")", arr_literal)
+        arr = [a or b for a, b in items]
+    except Exception:
+        return None
+    if not arr:
+        return None
+
+    rot_match = re.search(
+        rf"\(\s*function\s*\([^)]*\)\s*\{{[^}}]*{re.escape(arr_name)}[^}}]*\}}\s*\([^)]*\)\s*\)\s*;",
+        text,
+        re.DOTALL,
+    )
+    rotated = list(arr)
+    if rot_match:
+        for shift in range(len(arr)):
+            rotated.append(rotated.pop(0))
+
+    accessor = re.search(
+        rf"(?:var|let|const)\s+(_0x[a-f0-9]+)\s*=\s*function\s*\(\s*([a-zA-Z_$][\w$]*)\s*,\s*([a-zA-Z_$][\w$]*)\s*\)",
+        text,
+    )
+    if not accessor:
+        return None
+    fn_name = accessor.group(1)
+
+    def repl(match: "re.Match") -> str:
+        idx_str = match.group(1)
+        try:
+            if idx_str.startswith("0x"):
+                idx = int(idx_str, 16)
+            else:
+                idx = int(idx_str)
+            if 0 <= idx < len(rotated):
+                return "'" + rotated[idx].replace("\\", "\\\\").replace("'", "\\'") + "'"
+        except Exception:
+            pass
+        return match.group(0)
+
+    new_text = re.sub(rf"{re.escape(fn_name)}\s*\(\s*(0x[0-9a-fA-F]+|\d+)\s*(?:,\s*['\"][^'\"]*['\"])?\s*\)", repl, text)
+    if new_text == text:
+        return None
+    return _js_beautify(new_text)
+
+
+def _try_js_eval_unwrap(text: str) -> Optional[str]:
+    m = re.search(r"\beval\s*\(\s*(?:function\s*\([^)]*\)\s*\{\s*return\s+)?(['\"])((?:\\.|(?!\1).)*)\1", text, re.DOTALL)
+    if m:
+        payload = m.group(2)
+        try:
+            decoded = payload.encode("utf-8").decode("unicode_escape")
+            if decoded and decoded != text:
+                return _js_beautify(decoded)
+        except Exception:
+            pass
+    m2 = re.search(r"\beval\s*\(\s*atob\s*\(\s*(['\"])([A-Za-z0-9+/=\s]+)\1\s*\)\s*\)", text)
+    if m2:
+        dec = _b64_decode_safe(m2.group(2))
+        if dec:
+            t = _to_text(dec)
+            if t:
+                return _js_beautify(t)
+    m3 = re.search(r"Function\s*\(\s*(['\"])((?:\\.|(?!\1).)*)\1\s*\)\s*\(\s*\)", text, re.DOTALL)
+    if m3:
+        try:
+            decoded = m3.group(2).encode("utf-8").decode("unicode_escape")
+            if decoded:
+                return _js_beautify(decoded)
+        except Exception:
+            pass
     return None
 
 
-def _try_unicode_escapes(text: str) -> Optional[bytes]:
-    if "\\u" not in text:
+def _try_js_atob_wrapper(text: str) -> Optional[str]:
+    for pat in (
+        r"atob\s*\(\s*(['\"])([A-Za-z0-9+/=\s]+)\1\s*\)",
+        r"Buffer\.from\s*\(\s*(['\"])([A-Za-z0-9+/=\s]+)\1\s*,\s*['\"]base64['\"]\s*\)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            dec = _b64_decode_safe(m.group(2))
+            if dec:
+                t = _to_text(dec)
+                if t and _looks_like_code(t):
+                    return _js_beautify(t)
+    return None
+
+
+def _try_py_marshal(data: bytes) -> Optional[str]:
+    text = _to_text(data)
+    if not text:
         return None
+    m = re.search(r"marshal\.loads\s*\(\s*(?:base64\.b64decode\s*\(\s*)?b?(['\"])([A-Za-z0-9+/=\\xX]+)\1", text)
+    if not m:
+        return None
+    payload = m.group(2)
+    try:
+        raw = _b64_decode_safe(payload)
+        if raw is None:
+            try:
+                raw = payload.encode("latin-1").decode("unicode_escape").encode("latin-1")
+            except Exception:
+                return None
+        obj = marshal.loads(raw)
+        import dis
+        buf = io.StringIO()
+        dis.dis(obj, file=buf)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _try_py_exec_compile(data: bytes) -> Optional[str]:
+    text = _to_text(data)
+    if not text:
+        return None
+    m = re.search(r"exec\s*\(\s*compile\s*\(\s*(?:base64\.b64decode\s*\(\s*)?b?(['\"])([A-Za-z0-9+/=]+)\1", text)
+    if m:
+        dec = _b64_decode_safe(m.group(2))
+        if dec:
+            t = _to_text(dec)
+            if t:
+                return t
+    m2 = re.search(r"exec\s*\(\s*(['\"])((?:\\x[0-9a-fA-F]{2})+)\1\s*\)", text)
+    if m2:
+        try:
+            return m2.group(2).encode("utf-8").decode("unicode_escape")
+        except Exception:
+            return None
+    m3 = re.search(r"exec\s*\(\s*base64\.b64decode\s*\(\s*b?(['\"])([A-Za-z0-9+/=]+)\1", text)
+    if m3:
+        dec = _b64_decode_safe(m3.group(2))
+        if dec:
+            t = _to_text(dec)
+            if t:
+                return t
+    return None
+
+
+def _try_raw_base64(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if "\n" in stripped or " " in stripped or "\t" in stripped:
+        return None
+    if len(stripped) < 16:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", stripped):
+        return None
+    dec = _b64_decode_safe(stripped)
+    if dec is None:
+        return None
+    if not is_printable_text(dec):
+        return None
+    return dec.decode("utf-8", errors="replace")
+
+
+def _try_multiline_base64(text: str) -> Optional[str]:
+    joined = re.sub(r"\s+", "", text)
+    if len(joined) < 32:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", joined):
+        return None
+    if "\n" not in text.strip():
+        return None
+    dec = _b64_decode_safe(joined)
+    if dec is None or not is_printable_text(dec):
+        return None
+    return dec.decode("utf-8", errors="replace")
+
+
+def _try_base64_chunks(text: str) -> Optional[str]:
+    chunks = re.findall(r"[A-Za-z0-9+/]{60,}={0,2}", text)
+    if len(chunks) < 2:
+        return None
+    joined = "".join(chunks)
+    dec = _b64_decode_safe(joined)
+    if dec is None or not is_printable_text(dec):
+        return None
+    return dec.decode("utf-8", errors="replace")
+
+
+def _try_hex_string(text: str) -> Optional[str]:
+    stripped = re.sub(r"\s+", "", text)
+    if len(stripped) < 20 or len(stripped) % 2 != 0:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]+", stripped):
+        return None
+    try:
+        dec = bytes.fromhex(stripped)
+    except ValueError:
+        return None
+    if not is_printable_text(dec):
+        return None
+    return dec.decode("utf-8", errors="replace")
+
+
+def _try_hex_escapes(text: str) -> Optional[str]:
+    if len(re.findall(r"\\x[0-9a-fA-F]{2}", text)) < 3:
+        return None
+    out = re.sub(
+        r"\\x([0-9a-fA-F]{2})",
+        lambda m: chr(int(m.group(1), 16)),
+        text,
+    )
+    return out if out != text else None
+
+
+def _try_percent_encoding(text: str) -> Optional[str]:
+    pct = text.count("%")
+    if pct < 5 or (pct / max(len(text), 1)) < 0.05:
+        return None
+    try:
+        out = urllib.parse.unquote(text)
+        return out if out != text else None
+    except Exception:
+        return None
+
+
+def _try_html_entities(text: str) -> Optional[str]:
+    if len(re.findall(r"&[#a-zA-Z0-9]+;", text)) < 3:
+        return None
+    out = html.unescape(text)
+    return out if out != text else None
+
+
+def _try_unicode_escapes(text: str) -> Optional[str]:
     if len(re.findall(r"\\u[0-9a-fA-F]{4}", text)) < 3:
         return None
-    try:
-        decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
-        if is_printable_text(decoded.encode("utf-8")):
-            return decoded.encode("utf-8")
-    except Exception:
-        pass
-    return None
+    out = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text,
+    )
+    return out if out != text else None
 
 
-def _try_js_string_escape(text: str) -> Optional[bytes]:
-    if "\\" not in text:
+def _try_octal_escapes(text: str) -> Optional[str]:
+    if len(re.findall(r"\\[0-7]{3}", text)) < 3:
         return None
-    if len(re.findall(r"\\[nrtbf\"'\\]", text)) < 3:
+    out = re.sub(
+        r"\\([0-7]{3})",
+        lambda m: chr(int(m.group(1), 8)),
+        text,
+    )
+    return out if out != text else None
+
+
+def _try_js_string_escapes(text: str) -> Optional[str]:
+    cnt = sum(text.count(esc) for esc in ("\\n", "\\t", "\\r", "\\\""))
+    if cnt < 3:
         return None
     try:
-        decoded = text.encode("raw_unicode_escape").decode("unicode_escape")
-        if is_printable_text(decoded.encode("utf-8")) and decoded != text:
-            return decoded.encode("utf-8")
+        out = text.encode("utf-8").decode("raw_unicode_escape")
+        return out if out != text else None
     except Exception:
-        pass
-    return None
+        return None
 
 
-def _try_json_base64_values(text: str) -> Optional[bytes]:
+def _try_json_b64_fields(text: str) -> Optional[str]:
+    import json
     try:
         obj = json.loads(text)
     except Exception:
         return None
     changed = [False]
 
-    def transform(o):
-        if isinstance(o, str) and len(o) > 40:
-            decoded = _b64_decode_safe(o)
-            if decoded is not None:
-                try:
-                    s = decoded.decode("utf-8")
-                    changed[0] = True
-                    return s
-                except Exception:
-                    pass
-        if isinstance(o, dict):
-            return {k: transform(v) for k, v in o.items()}
-        if isinstance(o, list):
-            return [transform(i) for i in o]
-        return o
+    def walk(x: Any) -> Any:
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        if isinstance(x, str) and len(x) >= 16 and re.fullmatch(r"[A-Za-z0-9+/=]+", x):
+            dec = _b64_decode_safe(x)
+            if dec and is_printable_text(dec):
+                changed[0] = True
+                return dec.decode("utf-8", errors="replace")
+        return x
 
-    result = transform(obj)
-    if changed[0]:
-        return json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+    new_obj = walk(obj)
+    if not changed[0]:
+        return None
+    return json.dumps(new_obj, indent=2, ensure_ascii=False)
+
+
+def _try_rot13(text: str) -> Optional[str]:
+    if _looks_like_code(text):
+        return None
+    import codecs
+    try:
+        out = codecs.decode(text, "rot_13")
+    except Exception:
+        return None
+    if out == text:
+        return None
+    if _looks_like_code(out):
+        return out
     return None
 
 
-def _try_octal_escape(text: str) -> Optional[bytes]:
-    if "\\" not in text:
+def _try_jsfuck(text: str) -> Optional[str]:
+    stripped = re.sub(r"\s+", "", text)
+    if len(stripped) < 40:
         return None
-    if len(re.findall(r"\\[0-7]{3}", text)) < 3:
+    allowed = set("[]()!+")
+    cnt = sum(1 for ch in stripped if ch in allowed)
+    if cnt / len(stripped) < 0.9:
+        return None
+    out = _run_subproc(
+        ["node", "-e", f"try{{var r=eval({text});if(r!=null)process.stdout.write(String(r))}}catch(e){{process.exit(1)}}"],
+        timeout=JSFUCK_TIMEOUT,
+    )
+    if out is None or not out:
         return None
     try:
-        decoded = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
-        if is_printable_text(decoded.encode("utf-8")):
-            return decoded.encode("utf-8")
+        return out.decode("utf-8", errors="replace")
     except Exception:
-        pass
+        return None
+
+
+def _try_brainfuck(text: str) -> Optional[str]:
+    non_ws = [c for c in text if not c.isspace()]
+    if len(non_ws) < 50:
+        return None
+    bf_chars = set("><+-.,[]")
+    cnt = sum(1 for c in non_ws if c in bf_chars)
+    if cnt / len(non_ws) < 0.8:
+        return None
+    code = [c for c in text if c in bf_chars]
+    tape = bytearray(30000)
+    ptr = 0
+    pc = 0
+    out = bytearray()
+    steps = 0
+    bracket_map: Dict[int, int] = {}
+    stack: List[int] = []
+    for i, ch in enumerate(code):
+        if ch == "[":
+            stack.append(i)
+        elif ch == "]":
+            if not stack:
+                return None
+            j = stack.pop()
+            bracket_map[i] = j
+            bracket_map[j] = i
+    if stack:
+        return None
+    while pc < len(code) and steps < BF_MAX_STEPS:
+        ch = code[pc]
+        if ch == ">":
+            ptr = (ptr + 1) % 30000
+        elif ch == "<":
+            ptr = (ptr - 1) % 30000
+        elif ch == "+":
+            tape[ptr] = (tape[ptr] + 1) & 0xFF
+        elif ch == "-":
+            tape[ptr] = (tape[ptr] - 1) & 0xFF
+        elif ch == ".":
+            out.append(tape[ptr])
+        elif ch == ",":
+            tape[ptr] = 0
+        elif ch == "[":
+            if tape[ptr] == 0:
+                pc = bracket_map[pc]
+        elif ch == "]":
+            if tape[ptr] != 0:
+                pc = bracket_map[pc]
+        pc += 1
+        steps += 1
+    if not out:
+        return None
+    try:
+        return out.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _try_php_obfuscation(text: str) -> Optional[str]:
+    m = re.search(r"eval\s*\(\s*(?:gzinflate\s*\(\s*)?base64_decode\s*\(\s*(['\"])([A-Za-z0-9+/=]+)\1", text)
+    if not m:
+        return None
+    dec = _b64_decode_safe(m.group(2))
+    if dec is None:
+        return None
+    if not is_printable_text(dec):
+        try:
+            import zlib
+            dec = zlib.decompress(dec, -15)
+        except Exception:
+            return None
+    if not is_printable_text(dec):
+        return None
+    return dec.decode("utf-8", errors="replace")
+
+
+def _try_java_unicode(text: str) -> Optional[str]:
+    if len(re.findall(r"\\u[0-9a-fA-F]{4}", text)) < 5:
+        return None
+    out = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text,
+    )
+    return out if out != text else None
+
+
+def _try_reversed(text: str) -> Optional[str]:
+    if len(text) < 30:
+        return None
+    if _looks_like_code(text):
+        return None
+    rev = text[::-1]
+    if _looks_like_code(rev):
+        return rev
     return None
 
 
-def process_zip(raw: bytes, progress_cb=None) -> tuple[bytes, dict]:
-    stats = {"decoded": [], "clean": [], "binary_skipped": [], "error": []}
-    method_counts: dict[str, int] = {}
-
-    with zipfile.ZipFile(io.BytesIO(raw)) as zin:
-        all_items = [i for i in zin.infolist() if not i.is_dir()]
-        total = len(all_items)
-
-    out_buf = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(raw)) as zin, zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
-        for idx, item in enumerate(zin.infolist()):
-            if item.is_dir():
-                try:
-                    zout.mkdir(item)
-                except Exception:
-                    pass
-                continue
-
-            if progress_cb:
-                progress_cb(idx + 1, total, item.filename)
-
+def _try_xor_single_byte(data: bytes) -> Optional[str]:
+    if len(data) < 30 or len(data) > 200000:
+        return None
+    if is_printable_text(data):
+        return None
+    best: Tuple[int, Optional[str]] = (0, None)
+    for key in range(1, 256):
+        dec = bytes(b ^ key for b in data[:4096])
+        try:
+            t = dec.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        printable = sum(1 for ch in t if 32 <= ord(ch) < 127 or ch in "\n\r\t")
+        score = printable
+        if score > best[0] and _looks_like_code(t):
+            full = bytes(b ^ key for b in data)
             try:
-                data = zin.read(item.filename)
-            except Exception as e:
-                stats["error"].append(f"{item.filename}: read error {e}")
-                continue
-
-            ext = Path(item.filename).suffix.lower()
-            if ext in BINARY_EXTS:
-                zout.writestr(item, data)
-                stats["binary_skipped"].append(item.filename)
-                continue
-
-            try:
-                cleaned, methods = detect_and_decode(data, item.filename)
-                zout.writestr(item, cleaned)
-                if methods:
-                    label = " → ".join(methods)
-                    stats["decoded"].append({"file": item.filename, "methods": label})
-                    for m in methods:
-                        method_counts[m] = method_counts.get(m, 0) + 1
-                else:
-                    stats["clean"].append(item.filename)
-            except Exception as e:
-                log.exception(f"Error processing {item.filename}")
-                zout.writestr(item, data)
-                stats["error"].append(f"{item.filename}: {e}")
-
-    stats["method_counts"] = method_counts
-    return out_buf.getvalue(), stats
+                best = (score, full.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+    return best[1]
 
 
-def build_confirm_kb(job_id: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Decode it", callback_data=f"confirm:{job_id}")
-    kb.button(text="❌ Cancel", callback_data=f"cancel:{job_id}")
-    kb.adjust(2)
-    return kb.as_markup()
+def _single_pass(data: bytes, filename: str) -> Tuple[bytes, Optional[str]]:
+    ext = os.path.splitext(filename)[1].lower()
+    text = _to_text(data)
+    if text is None:
+        return data, None
+
+    if ext in JS_EXTS or "_0x" in text:
+        if re.search(r"_0x[a-f0-9]{4,}", text):
+            r = _try_synchrony(text)
+            if r and r != text:
+                return _js_beautify(r).encode("utf-8"), "js_0x_synchrony"
+            r = _try_js_0x_fallback(text)
+            if r and r != text:
+                return r.encode("utf-8"), "js_0x_fallback"
+
+    if ext in JS_EXTS or "eval(" in text or "Function(" in text:
+        r = _try_js_eval_unwrap(text)
+        if r and r != text:
+            return r.encode("utf-8"), "js_eval_unwrap"
+
+    if "atob(" in text or "Buffer.from" in text:
+        r = _try_js_atob_wrapper(text)
+        if r and r != text:
+            return r.encode("utf-8"), "js_atob_wrapper"
+
+    if ext in PY_EXTS or "marshal" in text:
+        r = _try_py_marshal(data)
+        if r and r != text:
+            return r.encode("utf-8"), "py_marshal"
+
+    if ext in PY_EXTS or "exec(" in text:
+        r = _try_py_exec_compile(data)
+        if r and r != text:
+            return r.encode("utf-8"), "py_exec_compile"
+
+    r = _try_raw_base64(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "base64_raw"
+
+    r = _try_multiline_base64(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "base64_multiline"
+
+    r = _try_base64_chunks(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "base64_chunks"
+
+    r = _try_hex_string(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "hex_string"
+
+    r = _try_hex_escapes(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "hex_escapes"
+
+    r = _try_percent_encoding(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "uri_percent"
+
+    r = _try_html_entities(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "html_entities"
+
+    r = _try_unicode_escapes(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "unicode_escapes"
+
+    r = _try_octal_escapes(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "octal_escapes"
+
+    r = _try_js_string_escapes(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "js_string_escapes"
+
+    r = _try_json_b64_fields(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "json_b64_fields"
+
+    r = _try_rot13(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "rot13"
+
+    r = _try_jsfuck(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "jsfuck"
+
+    r = _try_brainfuck(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "brainfuck"
+
+    if ext in PHP_EXTS or "<?php" in text:
+        r = _try_php_obfuscation(text)
+        if r is not None and r != text:
+            return r.encode("utf-8"), "php_eval_b64"
+
+    if ext in {".java", ".kt", ".kts"}:
+        r = _try_java_unicode(text)
+        if r is not None and r != text:
+            return r.encode("utf-8"), "java_unicode"
+
+    r = _try_reversed(text)
+    if r is not None and r != text:
+        return r.encode("utf-8"), "string_reverse"
+
+    r = _try_xor_single_byte(data)
+    if r is not None:
+        return r.encode("utf-8"), "xor_single_byte"
+
+    return data, None
 
 
-def build_done_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Send another zip", callback_data="new")
-    kb.button(text="✔️ Done", callback_data="done")
-    kb.adjust(2)
-    return kb.as_markup()
+def detect_and_decode(data: bytes, filename: str) -> Tuple[bytes, List[str]]:
+    methods: List[str] = []
+    current = data
+    prev_hash = _md5(current)
+    for _ in range(MAX_PASSES):
+        new_data, method = _single_pass(current, filename)
+        new_hash = _md5(new_data)
+        if method is None or new_hash == prev_hash:
+            break
+        methods.append(method)
+        current = new_data
+        prev_hash = new_hash
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in JS_EXTS and methods:
+        t = _to_text(current)
+        if t is not None:
+            beaut = _js_beautify(t)
+            if beaut != t:
+                current = beaut.encode("utf-8")
+                methods.append("jsbeautify")
+    return current, methods
 
 
-def build_report(stats: dict, original_size: int, result_size: int) -> str:
-    decoded_count = len(stats["decoded"])
-    clean_count = len(stats["clean"])
-    skip_count = len(stats["binary_skipped"])
-    err_count = len(stats["error"])
-    method_counts: dict = stats.get("method_counts", {})
+def is_binary_file(filename: str, data: bytes) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in BINARY_EXTS:
+        return True
+    if not is_printable_text(data):
+        return True
+    return False
 
-    method_labels = {
-        "base64": "Base64",
-        "js_eval_unwrap": "JS eval/atob wrapper",
-        "hex": "Hex",
-        "uri_encoded": "URI / percent-encoded",
-        "html_entities": "HTML entities",
-        "rot13": "ROT13",
-        "unicode_escapes": "Unicode escapes",
-        "js_string_escape": "JS string escapes",
-        "json_base64_values": "JSON with Base64 values",
-        "octal_escape": "Octal escapes",
+
+def process_zip_sync(zip_bytes: bytes, progress_state: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
+    stats: Dict[str, Any] = {
+        "decoded": 0,
+        "clean": 0,
+        "binary": 0,
+        "errors": [],
+        "methods": {},
+        "decoded_files": [],
+        "original_size": len(zip_bytes),
+        "output_size": 0,
     }
 
-    lines = ["<b>🔬 Decode Report</b>\n"]
-    lines.append(f"📂 Decoded files:  <b>{decoded_count}</b>")
-    lines.append(f"✨ Already clean:  <b>{clean_count}</b>")
-    lines.append(f"⏭ Binary skipped: <b>{skip_count}</b>")
-    if err_count:
-        lines.append(f"⚠️ Errors:         <b>{err_count}</b>")
+    src = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    names = [n for n in src.namelist() if not n.endswith("/")]
+    total = len(names)
+    progress_state["total"] = total
+    progress_state["done"] = 0
+    progress_state["current"] = ""
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            if info.is_dir():
+                dst.writestr(info, b"")
+                continue
+            try:
+                raw = src.read(info.filename)
+            except Exception as e:
+                stats["errors"].append(f"{info.filename}: read failed: {e}")
+                progress_state["done"] += 1
+                continue
+
+            progress_state["current"] = os.path.basename(info.filename) or info.filename
+
+            if is_binary_file(info.filename, raw):
+                dst.writestr(info, raw)
+                stats["binary"] += 1
+            else:
+                try:
+                    decoded, methods = detect_and_decode(raw, info.filename)
+                    if methods:
+                        dst.writestr(info, decoded)
+                        stats["decoded"] += 1
+                        stats["decoded_files"].append((info.filename, methods))
+                        for m in methods:
+                            stats["methods"][m] = stats["methods"].get(m, 0) + 1
+                    else:
+                        dst.writestr(info, raw)
+                        stats["clean"] += 1
+                except Exception as e:
+                    log.exception("decode failed for %s", info.filename)
+                    stats["errors"].append(f"{info.filename}: {e}")
+                    dst.writestr(info, raw)
+
+            progress_state["done"] += 1
+
+    src.close()
+    out_bytes = out_buf.getvalue()
+    stats["output_size"] = len(out_bytes)
+    progress_state["finished"] = True
+    return out_bytes, stats
+
+
+def render_progress_bar(done: int, total: int, current: str) -> str:
+    pct = int((done / total) * 100) if total else 0
+    filled = int((done / total) * 10) if total else 0
+    bar = "█" * filled + "░" * (10 - filled)
+    cur = current or "..."
+    if len(cur) > 40:
+        cur = cur[:37] + "..."
+    return (
+        f"⚙️ <b>Processing...</b>\n"
+        f"<code>[{bar}]</code> {pct}%\n"
+        f"<code>{done}/{total}</code> — <code>{html.escape(cur)}</code>"
+    )
+
+
+def render_report(stats: Dict[str, Any]) -> str:
+    lines = ["🔬 <b>Decode Report</b>", ""]
+    lines.append(f"📂 Decoded files: <b>{stats['decoded']}</b>")
+    lines.append(f"✨ Already clean: <b>{stats['clean']}</b>")
+    lines.append(f"⏭ Binary skipped: <b>{stats['binary']}</b>")
+    if stats["errors"]:
+        lines.append(f"⚠️ Errors: <b>{len(stats['errors'])}</b>")
     lines.append("")
-
-    if method_counts:
-        lines.append("<b>📊 Encoding types found:</b>")
-        for method, count in sorted(method_counts.items(), key=lambda x: -x[1]):
-            label = method_labels.get(method, method)
-            lines.append(f"  • {label}: <b>{count}</b>")
+    if stats["methods"]:
+        lines.append("📊 <b>Encoding/obfuscation types found:</b>")
+        for k, v in sorted(stats["methods"].items(), key=lambda x: -x[1]):
+            lines.append(f"  • <code>{html.escape(k)}</code>: {v}")
         lines.append("")
-
-    lines.append(f"📦 Original: <b>{original_size / 1024:.1f} KB</b>")
-    lines.append(f"📦 Output:   <b>{result_size / 1024:.1f} KB</b>")
-
-    if 0 < decoded_count <= 20:
-        lines.append("\n<b>📝 Files decoded:</b>")
-        for entry in stats["decoded"][:20]:
-            fname = Path(entry["file"]).name
-            lines.append(f"  <code>{fname}</code> → {entry['methods']}")
-
-    if stats["error"]:
-        lines.append("\n<b>⚠️ Errors:</b>")
-        for e in stats["error"][:5]:
-            lines.append(f"  <code>{e[:80]}</code>")
-
+    lines.append(f"📦 Original: <b>{stats['original_size'] // 1024} KB</b>")
+    lines.append(f"📦 Output: <b>{stats['output_size'] // 1024} KB</b>")
+    if stats["decoded_files"] and len(stats["decoded_files"]) <= 20:
+        lines.append("")
+        lines.append("📝 <b>Files decoded:</b>")
+        for fname, methods in stats["decoded_files"]:
+            chain = " → ".join(methods)
+            lines.append(f"  <code>{html.escape(fname)}</code> → {html.escape(chain)}")
+    if stats["errors"] and len(stats["errors"]) <= 10:
+        lines.append("")
+        lines.append("⚠️ <b>Errors:</b>")
+        for e in stats["errors"]:
+            lines.append(f"  • <code>{html.escape(str(e)[:200])}</code>")
     return "\n".join(lines)
 
 
+WELCOME = (
+    "👋 <b>ZIP Deobfuscator Bot</b>\n\n"
+    "Send me a <b>.zip</b> file and I'll auto-detect and decode every obfuscated "
+    "or encoded file inside it, then send back a clean zip with the original structure.\n\n"
+    "<b>Supported types:</b>\n"
+    "• JavaScript <code>_0x</code> obfuscation (synchrony + fallback)\n"
+    "• JS <code>eval()</code> / <code>Function()</code> wrappers\n"
+    "• JS <code>atob()</code> / <code>Buffer.from(...,'base64')</code>\n"
+    "• Python <code>marshal</code> / <code>exec(compile(...))</code>\n"
+    "• Base64 (single-line, multi-line, chunked)\n"
+    "• Hex strings &amp; <code>\\x</code> escapes\n"
+    "• URI percent-encoding\n"
+    "• HTML entities\n"
+    "• Unicode <code>\\uXXXX</code> &amp; octal escapes\n"
+    "• JS string escapes\n"
+    "• JSON with Base64 fields\n"
+    "• ROT13\n"
+    "• JSFuck (via node eval)\n"
+    "• Brainfuck (pure-Python interpreter)\n"
+    "• PHP <code>eval(base64_decode(...))</code> chains\n"
+    "• Java/Kotlin unicode escapes\n"
+    "• String reversal\n"
+    "• Single-byte XOR\n\n"
+    f"Max zip size: <b>{MAX_ZIP_MB} MB</b>.\n"
+    "Multi-layer chains are unwrapped automatically (up to 20 passes)."
+)
+
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)) if BOT_TOKEN else None
+dp = Dispatcher()
+
+pending_jobs: Dict[str, bytes] = {}
+
+
+def confirm_kb(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Decode it", callback_data=f"go:{job_id}"),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"),
+    ]])
+
+
+def done_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📦 Send another zip", callback_data="another"),
+        InlineKeyboardButton(text="✔️ Done", callback_data="done"),
+    ]])
+
+
 @dp.message(CommandStart())
-async def cmd_start(msg: Message):
-    await msg.answer(
-        "🤖 <b>ZIP Decoder Bot</b>\n\n"
-        "Send me a <code>.zip</code> file. I'll auto-detect and fully decode every encoded file inside — including chained/multi-layer encodings.\n\n"
-        "<b>Supported:</b>\n"
-        "• Base64 (raw, multiline, JS eval/atob wrappers, chained)\n"
-        "• Hex / \\x escapes\n"
-        "• URI / percent-encoding\n"
-        "• HTML entities\n"
-        "• Unicode escapes (\\u1234)\n"
-        "• JS string escapes\n"
-        "• JSON with Base64 field values\n"
-        "• Octal escapes\n"
-        "• ROT13\n"
-        "• Multi-layer (auto-unwrapped until real code is reached)\n\n"
-        f"Max size: <b>{MAX_ZIP_MB} MB</b>",
-        parse_mode=ParseMode.HTML,
-    )
+async def cmd_start(m: Message) -> None:
+    await m.answer(WELCOME)
 
 
 @dp.message(Command("help"))
-async def cmd_help(msg: Message):
-    await cmd_start(msg)
+async def cmd_help(m: Message) -> None:
+    await m.answer(WELCOME)
 
 
 @dp.message(F.document)
-async def handle_doc(msg: Message):
-    doc = msg.document
-    if not doc.file_name.lower().endswith(".zip"):
-        await msg.answer("❗ Please send a <code>.zip</code> file.", parse_mode=ParseMode.HTML)
+async def on_document(m: Message) -> None:
+    doc: Document = m.document
+    fname = doc.file_name or "file"
+    if not fname.lower().endswith(".zip"):
+        await m.reply("⚠️ Please send a <b>.zip</b> file.")
+        return
+    if doc.file_size and doc.file_size > MAX_ZIP_BYTES:
+        await m.reply(f"⚠️ Zip too large. Max allowed is <b>{MAX_ZIP_MB} MB</b>.")
         return
 
-    file_mb = doc.file_size / (1024 * 1024)
-    if file_mb > MAX_ZIP_MB:
-        await msg.answer(f"❗ File too large (<b>{file_mb:.1f} MB</b>). Max is <b>{MAX_ZIP_MB} MB</b>.", parse_mode=ParseMode.HTML)
+    await bot.send_chat_action(m.chat.id, ChatAction.UPLOAD_DOCUMENT)
+    try:
+        buf = io.BytesIO()
+        await bot.download(doc, destination=buf)
+        zip_bytes = buf.getvalue()
+    except Exception as e:
+        log.exception("download failed")
+        await m.reply(f"❌ Failed to download file: <code>{html.escape(str(e))}</code>")
         return
-
-    status = await msg.answer("⬇️ Downloading...")
-    buf = io.BytesIO()
-    await bot.download(doc, destination=buf)
-    raw = buf.getvalue()
 
     try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            all_files = [i for i in zf.infolist() if not i.is_dir()]
-            total_files = len(all_files)
-            total_size = sum(i.file_size for i in all_files)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+            entries = [i for i in z.infolist() if not i.is_dir()]
+            file_count = len(entries)
+            uncompressed = sum(i.file_size for i in entries)
     except zipfile.BadZipFile:
-        await status.edit_text("❌ Invalid zip file.")
+        await m.reply("❌ Invalid or corrupted zip file.")
         return
 
-    job_id = f"{msg.from_user.id}_{msg.message_id}"
-    pending_jobs[job_id] = raw
+    job_id = f"{m.from_user.id}_{m.message_id}"
+    pending_jobs[job_id] = zip_bytes
 
-    await status.edit_text(
-        f"📂 <b>{doc.file_name}</b>\n"
-        f"📄 <b>{total_files}</b> file(s) — <b>{total_size / 1024:.1f} KB</b> uncompressed\n\n"
-        "Start decoding?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_confirm_kb(job_id),
+    await m.reply(
+        f"📦 <b>{html.escape(fname)}</b>\n"
+        f"📁 Files: <b>{file_count}</b>\n"
+        f"📐 Uncompressed: <b>{uncompressed // 1024} KB</b>\n"
+        f"💾 Zip: <b>{len(zip_bytes) // 1024} KB</b>\n\n"
+        "Ready to decode?",
+        reply_markup=confirm_kb(job_id),
     )
 
 
-@dp.callback_query(F.data.startswith("confirm:"))
-async def cb_confirm(cq: CallbackQuery):
-    job_id = cq.data.split(":", 1)[1]
-    raw = pending_jobs.pop(job_id, None)
-    if raw is None:
-        await cq.answer("Session expired. Resend the zip.", show_alert=True)
-        await cq.message.edit_reply_markup(reply_markup=None)
-        return
-
-    await cq.answer()
-    progress_msg = await cq.message.edit_text("⚙️ Starting...", reply_markup=None)
-
-    progress_state = {"current": 0, "total": 0, "filename": ""}
-
-    def sync_process():
-        def progress_cb(current, total, filename):
-            progress_state["current"] = current
-            progress_state["total"] = total
-            progress_state["filename"] = filename
-        return process_zip(raw, progress_cb)
-
-    stop_event = asyncio.Event()
-
-    async def progress_poller():
-        last_current = -1
-        while not stop_event.is_set():
-            await asyncio.sleep(1.5)
-            c = progress_state["current"]
-            t = progress_state["total"]
-            f = progress_state["filename"]
-            if t > 0 and c != last_current:
-                last_current = c
-                pct = int(c / t * 100)
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                fname = Path(f).name[:35] if f else ""
-                try:
-                    await progress_msg.edit_text(
-                        f"⚙️ Processing...\n[{bar}] {pct}%\n<code>{c}/{t}</code> — <code>{fname}</code>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-
-    poller = asyncio.create_task(progress_poller())
-    try:
-        result_zip, stats = await asyncio.get_event_loop().run_in_executor(None, sync_process)
-    finally:
-        stop_event.set()
-        poller.cancel()
-        try:
-            await poller
-        except asyncio.CancelledError:
-            pass
-
-    report = build_report(stats, len(raw), len(result_zip))
-    await progress_msg.edit_text(report, parse_mode=ParseMode.HTML)
-
-    out_file = BufferedInputFile(result_zip, filename="decoded_output.zip")
-    await cq.message.answer_document(
-        out_file,
-        caption="✅ <b>Clean zip ready.</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_done_kb(),
-    )
+async def progress_loop(chat_id: int, msg_id: int, state: Dict[str, Any]) -> None:
+    last_text = ""
+    while not state.get("finished"):
+        await asyncio.sleep(1.5)
+        total = state.get("total", 0)
+        done = state.get("done", 0)
+        current = state.get("current", "")
+        if not total:
+            continue
+        text = render_progress_bar(done, total, current)
+        if text != last_text:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+                last_text = text
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
-async def cb_cancel(cq: CallbackQuery):
-    job_id = cq.data.split(":", 1)[1]
+async def on_cancel(c: CallbackQuery) -> None:
+    job_id = c.data.split(":", 1)[1]
     pending_jobs.pop(job_id, None)
-    await cq.answer("Cancelled.")
-    await cq.message.edit_text("❌ Cancelled.", reply_markup=None)
+    await c.message.edit_text("❌ Cancelled.")
+    await c.answer()
 
 
-@dp.callback_query(F.data == "new")
-async def cb_new(cq: CallbackQuery):
-    await cq.answer()
-    await cq.message.answer("📤 Send your zip file.")
+@dp.callback_query(F.data.startswith("go:"))
+async def on_go(c: CallbackQuery) -> None:
+    job_id = c.data.split(":", 1)[1]
+    zip_bytes = pending_jobs.pop(job_id, None)
+    if zip_bytes is None:
+        await c.answer("Job expired.", show_alert=True)
+        return
+
+    await c.answer()
+    progress_msg = await c.message.edit_text(
+        "⚙️ <b>Processing...</b>\n<code>[░░░░░░░░░░]</code> 0%\nstarting..."
+    )
+
+    state: Dict[str, Any] = {"total": 0, "done": 0, "current": "", "finished": False}
+    poll_task = asyncio.create_task(progress_loop(c.message.chat.id, progress_msg.message_id, state))
+
+    loop = asyncio.get_event_loop()
+    try:
+        out_bytes, stats = await loop.run_in_executor(None, process_zip_sync, zip_bytes, state)
+    except zipfile.BadZipFile:
+        state["finished"] = True
+        await poll_task
+        await progress_msg.edit_text("❌ Invalid zip.")
+        return
+    except Exception as e:
+        log.exception("process failed")
+        state["finished"] = True
+        await poll_task
+        await progress_msg.edit_text(f"❌ Processing failed: <code>{html.escape(str(e))}</code>")
+        return
+
+    state["finished"] = True
+    await poll_task
+
+    try:
+        await progress_msg.edit_text(
+            f"⚙️ <b>Processing...</b>\n<code>[██████████]</code> 100%\n<code>{stats['decoded'] + stats['clean'] + stats['binary']}/{state.get('total', 0)}</code> — done"
+        )
+    except Exception:
+        pass
+
+    await c.message.answer(render_report(stats))
+
+    out_name = f"decoded_{int(time.time())}.zip"
+    await c.message.answer_document(
+        BufferedInputFile(out_bytes, filename=out_name),
+        caption="✅ Done.",
+        reply_markup=done_kb(),
+    )
+
+
+@dp.callback_query(F.data == "another")
+async def on_another(c: CallbackQuery) -> None:
+    await c.answer()
+    await c.message.answer("📥 Send me the next <b>.zip</b> file.")
 
 
 @dp.callback_query(F.data == "done")
-async def cb_done(cq: CallbackQuery):
-    await cq.answer("👍")
-    await cq.message.edit_reply_markup(reply_markup=None)
+async def on_done(c: CallbackQuery) -> None:
+    await c.answer("👋")
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
-async def health_server():
-    from aiohttp import web
-    port = int(os.environ.get("PORT", "8080"))
+async def health(_request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def start_health_server() -> None:
     app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="OK"))
-    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"Health server on port {port}")
+    log.info("health server listening on :%d", PORT)
 
 
-async def main():
-    log.info("Bot starting...")
-    await health_server()
+async def main() -> None:
+    if not BOT_TOKEN:
+        log.error("BOT_TOKEN env var is required")
+        sys.exit(1)
+    await start_health_server()
+    log.info("starting polling (max_zip_mb=%d)", MAX_ZIP_MB)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
