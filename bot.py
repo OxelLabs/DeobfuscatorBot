@@ -1,19 +1,15 @@
 import asyncio
 import base64
-import binascii
 import codecs
 import hashlib
 import html
 import io
 import json
 import logging
-import math
 import os
 import re
-import struct
 import urllib.parse
 import zipfile
-import zlib
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +19,6 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
@@ -49,15 +44,6 @@ BINARY_EXTS = {
     ".psd", ".ai", ".sketch",
 }
 
-TEXT_EXTS = {
-    ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
-    ".py", ".rb", ".php", ".java", ".cs", ".go", ".rs", ".cpp", ".c", ".h",
-    ".html", ".htm", ".css", ".scss", ".sass", ".less",
-    ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".env",
-    ".txt", ".md", ".csv", ".sql", ".sh", ".bat", ".ps1",
-    ".vue", ".svelte", ".astro",
-}
-
 
 def safe_decode(data: bytes) -> Optional[str]:
     for enc in ("utf-8", "latin-1", "cp1252"):
@@ -71,7 +57,7 @@ def safe_decode(data: bytes) -> Optional[str]:
 def is_printable_text(data: bytes) -> bool:
     if len(data) == 0:
         return False
-    sample = data[:4096]
+    sample = data[:8192]
     try:
         text = sample.decode("utf-8")
     except Exception:
@@ -80,27 +66,33 @@ def is_printable_text(data: bytes) -> bool:
     return non_printable / max(len(text), 1) < 0.05
 
 
-def strip_outer_quotes(s: str) -> str:
-    s = s.strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
-    return s
+def _b64_decode_safe(s: str) -> Optional[bytes]:
+    s = re.sub(r"[\s\r\n]+", "", s)
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", s):
+        return None
+    if len(s) < 16:
+        return None
+    pad = s + "=" * ((-len(s)) % 4)
+    try:
+        return base64.b64decode(pad)
+    except Exception:
+        return None
 
 
 def detect_and_decode(data: bytes, filename: str) -> tuple[bytes, list[str]]:
     methods_applied = []
     current = data
-    max_passes = 6
-
-    for _ in range(max_passes):
+    seen = set()
+    for _ in range(20):
+        h = hashlib.md5(current).hexdigest()
+        if h in seen:
+            break
+        seen.add(h)
         result, method = _single_pass(current, filename)
         if method is None:
             break
         methods_applied.append(method)
         current = result
-        if len(methods_applied) > 10:
-            break
-
     return current, methods_applied
 
 
@@ -108,161 +100,131 @@ def _single_pass(data: bytes, filename: str) -> tuple[bytes, Optional[str]]:
     text = safe_decode(data)
 
     if text is not None:
-        result = _try_js_eval_unwrap(text, data)
-        if result is not None:
-            return result, "js_eval_unwrap"
+        r = _try_js_eval_unwrap(text)
+        if r is not None:
+            return r, "js_eval_unwrap"
 
     if text is not None:
-        result = _try_pure_base64(text)
-        if result is not None:
-            return result, "base64"
+        r = _try_any_base64(text)
+        if r is not None:
+            return r, "base64"
 
     if text is not None:
-        result = _try_hex(text)
-        if result is not None:
-            return result, "hex"
+        r = _try_hex(text)
+        if r is not None:
+            return r, "hex"
 
     if text is not None:
-        result = _try_uri_encoding(text)
-        if result is not None:
-            return result, "uri_encoded"
+        r = _try_uri_encoding(text)
+        if r is not None:
+            return r, "uri_encoded"
 
     if text is not None:
-        result = _try_html_entities(text)
-        if result is not None:
-            return result, "html_entities"
+        r = _try_html_entities(text)
+        if r is not None:
+            return r, "html_entities"
 
     if text is not None:
-        result = _try_rot13(text)
-        if result is not None:
-            return result, "rot13"
+        r = _try_unicode_escapes(text)
+        if r is not None:
+            return r, "unicode_escapes"
 
     if text is not None:
-        result = _try_unicode_escapes(text)
-        if result is not None:
-            return result, "unicode_escapes"
+        r = _try_js_string_escape(text)
+        if r is not None:
+            return r, "js_string_escape"
 
     if text is not None:
-        result = _try_js_string_escape(text)
-        if result is not None:
-            return result, "js_string_escape"
+        r = _try_json_base64_values(text)
+        if r is not None:
+            return r, "json_base64_values"
 
     if text is not None:
-        result = _try_json_base64_values(text)
-        if result is not None:
-            return result, "json_base64_values"
+        r = _try_octal_escape(text)
+        if r is not None:
+            return r, "octal_escape"
 
     if text is not None:
-        result = _try_base64_multiline(text)
-        if result is not None:
-            return result, "base64_multiline"
-
-    if text is not None:
-        result = _try_octal_escape(text)
-        if result is not None:
-            return result, "octal_escape"
+        r = _try_rot13(text)
+        if r is not None:
+            return r, "rot13"
 
     return data, None
 
 
-def _try_js_eval_unwrap(text: str, raw: bytes) -> Optional[bytes]:
+def _try_js_eval_unwrap(text: str) -> Optional[bytes]:
     patterns = [
-        r'(?:let|var|const)\s+\w*encoded\w*\s*=\s*["\'\`]([A-Za-z0-9+/=\s]{60,})["\'\`]',
-        r'(?:eval|exec)\s*\(\s*(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/=\s]{60,})["\']',
-        r'atob\s*\(\s*["\']([A-Za-z0-9+/=\s]{60,})["\']',
-        r'Buffer\.from\s*\(\s*["\']([A-Za-z0-9+/=\s]{60,})["\'],\s*["\']base64["\']\s*\)',
-        r'(?:decode|fromBase64|b64decode)\s*\(\s*["\']([A-Za-z0-9+/=\s]{60,})["\']',
-        r'_0x[0-9a-f]+\s*\(\s*["\']([A-Za-z0-9+/=\s]{60,})["\']',
+        r'(?:let|var|const)\s+\w+\s*=\s*["\'\`]([A-Za-z0-9+/=\r\n]{40,})["\'\`]',
+        r'(?:eval|exec)\s*\(\s*(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
+        r'atob\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
+        r'Buffer\.from\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\'],\s*["\']base64["\']\s*\)',
+        r'(?:fromBase64|b64decode|decodeBase64)\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
+        r'_0x[0-9a-f]+\s*\(\s*["\']([A-Za-z0-9+/=\r\n]{40,})["\']',
     ]
     for pat in patterns:
-        m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
-        if m:
-            b64 = re.sub(r"\s+", "", m.group(1))
-            pad = b64 + "=" * ((-len(b64)) % 4)
-            try:
-                decoded = base64.b64decode(pad)
-                if is_printable_text(decoded):
-                    return decoded
-            except Exception:
-                pass
-    return None
-
-
-def _try_pure_base64(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-    clean = re.sub(r"\s+", "", stripped)
-    if len(clean) < 40:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9+/=]+", clean):
-        return None
-    if len(clean) % 4 != 0 and "=" not in clean:
-        pad = clean + "=" * ((-len(clean)) % 4)
-    else:
-        pad = clean
-    try:
-        decoded = base64.b64decode(pad)
-        if is_printable_text(decoded) and len(decoded) > 10:
-            ratio = len(decoded) / len(clean)
-            if 0.5 <= ratio <= 1.0:
+        for m in re.finditer(pat, text, re.DOTALL | re.IGNORECASE):
+            decoded = _b64_decode_safe(m.group(1))
+            if decoded is not None and is_printable_text(decoded):
                 return decoded
-    except Exception:
-        pass
     return None
 
 
-def _try_base64_multiline(text: str) -> Optional[bytes]:
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    if len(lines) < 2:
-        return None
-    combined = "".join(lines)
-    if not re.fullmatch(r"[A-Za-z0-9+/=]+", combined):
-        return None
-    if len(combined) < 60:
-        return None
-    pad = combined + "=" * ((-len(combined)) % 4)
-    try:
-        decoded = base64.b64decode(pad)
-        if is_printable_text(decoded):
+def _try_any_base64(text: str) -> Optional[bytes]:
+    stripped = text.strip()
+
+    clean = re.sub(r"[\s\r\n]+", "", stripped)
+    if len(clean) >= 16 and re.fullmatch(r"[A-Za-z0-9+/=]+", clean):
+        decoded = _b64_decode_safe(clean)
+        if decoded is not None and is_printable_text(decoded):
             return decoded
-    except Exception:
-        pass
+
+    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+    if len(lines) >= 2:
+        joined = "".join(lines)
+        if re.fullmatch(r"[A-Za-z0-9+/=]+", joined):
+            decoded = _b64_decode_safe(joined)
+            if decoded is not None and is_printable_text(decoded):
+                return decoded
+
+    chunks = re.findall(r"[A-Za-z0-9+/]{60,}={0,2}", stripped)
+    if chunks:
+        combined = "".join(chunks)
+        decoded = _b64_decode_safe(combined)
+        if decoded is not None and is_printable_text(decoded):
+            return decoded
+
     return None
 
 
 def _try_hex(text: str) -> Optional[bytes]:
     stripped = text.strip()
-    clean = re.sub(r"[\s\n\r]+", "", stripped)
-    clean = re.sub(r"^(0x)+", "", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"\\x", "", clean)
-    if len(clean) < 20 or len(clean) % 2 != 0:
-        return None
-    if not re.fullmatch(r"[0-9a-fA-F]+", clean):
-        return None
-    try:
-        decoded = bytes.fromhex(clean)
-        if is_printable_text(decoded):
-            return decoded
-    except Exception:
-        pass
-    hex_escape_pattern = r"(?:\\x[0-9a-fA-F]{2})+"
-    if re.search(hex_escape_pattern, stripped):
+    clean = re.sub(r"[\s\r\n]+", "", stripped)
+    clean = re.sub(r"^0x", "", clean, flags=re.IGNORECASE)
+    if len(clean) >= 20 and len(clean) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", clean):
         try:
-            result = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), stripped)
-            return result.encode("utf-8")
+            decoded = bytes.fromhex(clean)
+            if is_printable_text(decoded):
+                return decoded
         except Exception:
             pass
+
+    if re.search(r"(?:\\x[0-9a-fA-F]{2}){3,}", stripped):
+        try:
+            result = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), stripped)
+            if is_printable_text(result.encode("utf-8")):
+                return result.encode("utf-8")
+        except Exception:
+            pass
+
     return None
 
 
 def _try_uri_encoding(text: str) -> Optional[bytes]:
     stripped = text.strip()
-    if "%" not in stripped:
+    if stripped.count("%") < 5:
         return None
-    pct_count = stripped.count("%")
-    if pct_count < 5:
-        return None
-    total_chars = len(stripped.replace(" ", "").replace("\n", ""))
-    if pct_count / max(total_chars, 1) < 0.05:
+    total = len(stripped.replace(" ", "").replace("\n", ""))
+    if stripped.count("%") / max(total, 1) < 0.05:
         return None
     try:
         decoded = urllib.parse.unquote(stripped, errors="strict")
@@ -282,8 +244,7 @@ def _try_uri_encoding(text: str) -> Optional[bytes]:
 def _try_html_entities(text: str) -> Optional[bytes]:
     if "&" not in text or ";" not in text:
         return None
-    entity_count = len(re.findall(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);", text))
-    if entity_count < 3:
+    if len(re.findall(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);", text)) < 3:
         return None
     decoded = html.unescape(text)
     if decoded != text:
@@ -291,42 +252,33 @@ def _try_html_entities(text: str) -> Optional[bytes]:
     return None
 
 
-def _try_rot13(text: str) -> Optional[bytes]:
-    stripped = text.strip()
-    if len(stripped) < 20:
-        return None
-    if not re.search(r"[a-zA-Z]", stripped):
-        return None
-    decoded = codecs.decode(stripped, "rot_13")
-    if _looks_like_real_code_or_text(decoded) and not _looks_like_real_code_or_text(stripped):
-        return decoded.encode("utf-8")
-    return None
-
-
-def _looks_like_real_code_or_text(text: str) -> bool:
+def _looks_like_code(text: str) -> bool:
     keywords = ["function", "const", "var", "let", "return", "import", "export",
                  "class", "def ", "print", "require", "module", "if ", "for ",
                  "while", "async", "await", "the ", "and ", "this", "that"]
     lower = text.lower()
-    hits = sum(1 for kw in keywords if kw in lower)
-    return hits >= 2
+    return sum(1 for kw in keywords if kw in lower) >= 2
+
+
+def _try_rot13(text: str) -> Optional[bytes]:
+    stripped = text.strip()
+    if len(stripped) < 20 or not re.search(r"[a-zA-Z]", stripped):
+        return None
+    decoded = codecs.decode(stripped, "rot_13")
+    if _looks_like_code(decoded) and not _looks_like_code(stripped):
+        return decoded.encode("utf-8")
+    return None
 
 
 def _try_unicode_escapes(text: str) -> Optional[bytes]:
-    if "\\u" not in text and "\\U" not in text:
+    if "\\u" not in text:
         return None
-    count = len(re.findall(r"\\u[0-9a-fA-F]{4}", text))
-    if count < 3:
+    if len(re.findall(r"\\u[0-9a-fA-F]{4}", text)) < 3:
         return None
-    try:
-        decoded = text.encode("utf-8").decode("unicode_escape")
-        if is_printable_text(decoded.encode("utf-8")):
-            return decoded.encode("utf-8")
-    except Exception:
-        pass
     try:
         decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
-        return decoded.encode("utf-8")
+        if is_printable_text(decoded.encode("utf-8")):
+            return decoded.encode("utf-8")
     except Exception:
         pass
     return None
@@ -335,11 +287,10 @@ def _try_unicode_escapes(text: str) -> Optional[bytes]:
 def _try_js_string_escape(text: str) -> Optional[bytes]:
     if "\\" not in text:
         return None
-    escape_count = len(re.findall(r"\\[nrtbf\"'\\]", text))
-    if escape_count < 3:
+    if len(re.findall(r"\\[nrtbf\"'\\]", text)) < 3:
         return None
     try:
-        decoded = text.encode("utf-8").decode("unicode_escape")
+        decoded = text.encode("raw_unicode_escape").decode("unicode_escape")
         if is_printable_text(decoded.encode("utf-8")) and decoded != text:
             return decoded.encode("utf-8")
     except Exception:
@@ -352,17 +303,16 @@ def _try_json_base64_values(text: str) -> Optional[bytes]:
         obj = json.loads(text)
     except Exception:
         return None
-
     changed = [False]
 
     def transform(o):
         if isinstance(o, str) and len(o) > 40:
-            clean = re.sub(r"\s+", "", o)
-            if re.fullmatch(r"[A-Za-z0-9+/=]+", clean) and len(clean) % 4 == 0:
+            decoded = _b64_decode_safe(o)
+            if decoded is not None:
                 try:
-                    decoded = base64.b64decode(clean).decode("utf-8")
+                    s = decoded.decode("utf-8")
                     changed[0] = True
-                    return decoded
+                    return s
                 except Exception:
                     pass
         if isinstance(o, dict):
@@ -380,8 +330,7 @@ def _try_json_base64_values(text: str) -> Optional[bytes]:
 def _try_octal_escape(text: str) -> Optional[bytes]:
     if "\\" not in text:
         return None
-    count = len(re.findall(r"\\[0-7]{3}", text))
-    if count < 3:
+    if len(re.findall(r"\\[0-7]{3}", text)) < 3:
         return None
     try:
         decoded = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
@@ -393,12 +342,7 @@ def _try_octal_escape(text: str) -> Optional[bytes]:
 
 
 def process_zip(raw: bytes, progress_cb=None) -> tuple[bytes, dict]:
-    stats = {
-        "decoded": [],
-        "clean": [],
-        "binary_skipped": [],
-        "error": [],
-    }
+    stats = {"decoded": [], "clean": [], "binary_skipped": [], "error": []}
     method_counts: dict[str, int] = {}
 
     with zipfile.ZipFile(io.BytesIO(raw)) as zin:
@@ -472,40 +416,38 @@ def build_report(stats: dict, original_size: int, result_size: int) -> str:
     err_count = len(stats["error"])
     method_counts: dict = stats.get("method_counts", {})
 
+    method_labels = {
+        "base64": "Base64",
+        "js_eval_unwrap": "JS eval/atob wrapper",
+        "hex": "Hex",
+        "uri_encoded": "URI / percent-encoded",
+        "html_entities": "HTML entities",
+        "rot13": "ROT13",
+        "unicode_escapes": "Unicode escapes",
+        "js_string_escape": "JS string escapes",
+        "json_base64_values": "JSON with Base64 values",
+        "octal_escape": "Octal escapes",
+    }
+
     lines = ["<b>🔬 Decode Report</b>\n"]
-    lines.append(f"📂 Decoded files:   <b>{decoded_count}</b>")
-    lines.append(f"✨ Already clean:   <b>{clean_count}</b>")
-    lines.append(f"⏭ Binary skipped:  <b>{skip_count}</b>")
+    lines.append(f"📂 Decoded files:  <b>{decoded_count}</b>")
+    lines.append(f"✨ Already clean:  <b>{clean_count}</b>")
+    lines.append(f"⏭ Binary skipped: <b>{skip_count}</b>")
     if err_count:
-        lines.append(f"⚠️ Errors:          <b>{err_count}</b>")
+        lines.append(f"⚠️ Errors:         <b>{err_count}</b>")
     lines.append("")
 
     if method_counts:
         lines.append("<b>📊 Encoding types found:</b>")
-        method_labels = {
-            "base64": "Base64",
-            "base64_multiline": "Base64 multiline",
-            "js_eval_unwrap": "JS eval/atob wrapper",
-            "hex": "Hex",
-            "uri_encoded": "URI / percent-encoded",
-            "html_entities": "HTML entities",
-            "rot13": "ROT13",
-            "unicode_escapes": "Unicode escapes (\\u)",
-            "js_string_escape": "JS string escapes",
-            "json_base64_values": "JSON with Base64 values",
-            "octal_escape": "Octal escapes (\\0)",
-        }
         for method, count in sorted(method_counts.items(), key=lambda x: -x[1]):
             label = method_labels.get(method, method)
             lines.append(f"  • {label}: <b>{count}</b>")
         lines.append("")
 
-    orig_kb = original_size / 1024
-    res_kb = result_size / 1024
-    lines.append(f"📦 Original size: <b>{orig_kb:.1f} KB</b>")
-    lines.append(f"📦 Output size:   <b>{res_kb:.1f} KB</b>")
+    lines.append(f"📦 Original: <b>{original_size / 1024:.1f} KB</b>")
+    lines.append(f"📦 Output:   <b>{result_size / 1024:.1f} KB</b>")
 
-    if decoded_count > 0 and decoded_count <= 20:
+    if 0 < decoded_count <= 20:
         lines.append("\n<b>📝 Files decoded:</b>")
         for entry in stats["decoded"][:20]:
             fname = Path(entry["file"]).name
@@ -523,19 +465,18 @@ def build_report(stats: dict, original_size: int, result_size: int) -> str:
 async def cmd_start(msg: Message):
     await msg.answer(
         "🤖 <b>ZIP Decoder Bot</b>\n\n"
-        "Send me any <code>.zip</code> file and I'll automatically detect and decode every encoded file inside.\n\n"
-        "<b>Supported encodings:</b>\n"
-        "• Base64 (raw, multiline, JS eval/atob wrappers)\n"
+        "Send me a <code>.zip</code> file. I'll auto-detect and fully decode every encoded file inside — including chained/multi-layer encodings.\n\n"
+        "<b>Supported:</b>\n"
+        "• Base64 (raw, multiline, JS eval/atob wrappers, chained)\n"
         "• Hex / \\x escapes\n"
         "• URI / percent-encoding\n"
         "• HTML entities\n"
-        "• ROT13\n"
         "• Unicode escapes (\\u1234)\n"
         "• JS string escapes\n"
         "• JSON with Base64 field values\n"
         "• Octal escapes\n"
-        "• Multi-layer/chained encodings (auto-unwrapped)\n\n"
-        "Binary files are passed through untouched.\n"
+        "• ROT13\n"
+        "• Multi-layer (auto-unwrapped until real code is reached)\n\n"
         f"Max size: <b>{MAX_ZIP_MB} MB</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -575,11 +516,10 @@ async def handle_doc(msg: Message):
     job_id = f"{msg.from_user.id}_{msg.message_id}"
     pending_jobs[job_id] = raw
 
-    size_kb = total_size / 1024
     await status.edit_text(
         f"📂 <b>{doc.file_name}</b>\n"
-        f"📄 <b>{total_files}</b> file(s) — <b>{size_kb:.1f} KB</b> uncompressed\n\n"
-        f"Start decoding?",
+        f"📄 <b>{total_files}</b> file(s) — <b>{total_size / 1024:.1f} KB</b> uncompressed\n\n"
+        "Start decoding?",
         parse_mode=ParseMode.HTML,
         reply_markup=build_confirm_kb(job_id),
     )
@@ -597,28 +537,6 @@ async def cb_confirm(cq: CallbackQuery):
     await cq.answer()
     progress_msg = await cq.message.edit_text("⚙️ Starting...", reply_markup=None)
 
-    last_update = [0]
-
-    async def update_progress(current: int, total: int, filename: str):
-        now = asyncio.get_event_loop().time()
-        if now - last_update[0] < 1.5 and current != total:
-            return
-        last_update[0] = now
-        pct = int(current / max(total, 1) * 100)
-        bar_filled = int(pct / 10)
-        bar = "█" * bar_filled + "░" * (10 - bar_filled)
-        fname = Path(filename).name[:35]
-        try:
-            await progress_msg.edit_text(
-                f"⚙️ Processing...\n"
-                f"[{bar}] {pct}%\n"
-                f"<code>{current}/{total}</code> — <code>{fname}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-
-    loop = asyncio.get_event_loop()
     progress_state = {"current": 0, "total": 0, "filename": ""}
 
     def sync_process():
@@ -628,27 +546,36 @@ async def cb_confirm(cq: CallbackQuery):
             progress_state["filename"] = filename
         return process_zip(raw, progress_cb)
 
-    async def progress_poller(stop_event: asyncio.Event):
-        last = [0.0]
+    stop_event = asyncio.Event()
+
+    async def progress_poller():
+        last_current = -1
         while not stop_event.is_set():
             await asyncio.sleep(1.5)
             c = progress_state["current"]
             t = progress_state["total"]
             f = progress_state["filename"]
-            if t > 0 and (c != last[0]):
-                last[0] = c
-                await update_progress(c, t, f)
+            if t > 0 and c != last_current:
+                last_current = c
+                pct = int(c / t * 100)
+                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                fname = Path(f).name[:35] if f else ""
+                try:
+                    await progress_msg.edit_text(
+                        f"⚙️ Processing...\n[{bar}] {pct}%\n<code>{c}/{t}</code> — <code>{fname}</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
 
-    stop_event = asyncio.Event()
-    poller_task = asyncio.create_task(progress_poller(stop_event))
-
+    poller = asyncio.create_task(progress_poller())
     try:
-        result_zip, stats = await loop.run_in_executor(None, sync_process)
+        result_zip, stats = await asyncio.get_event_loop().run_in_executor(None, sync_process)
     finally:
         stop_event.set()
-        poller_task.cancel()
+        poller.cancel()
         try:
-            await poller_task
+            await poller
         except asyncio.CancelledError:
             pass
 
@@ -675,7 +602,7 @@ async def cb_cancel(cq: CallbackQuery):
 @dp.callback_query(F.data == "new")
 async def cb_new(cq: CallbackQuery):
     await cq.answer()
-    await cq.message.answer("📤 Send your zip file.", parse_mode=ParseMode.HTML)
+    await cq.message.answer("📤 Send your zip file.")
 
 
 @dp.callback_query(F.data == "done")
