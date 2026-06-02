@@ -1,8 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: zip-decoder-bot
     runtime: python
     branch: main
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -11,4 +12,3 @@ services:
       - key: MAX_ZIP_MB
         value: "50"
     autoDeploy: true
-    healthCheckPath: ~

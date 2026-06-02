@@ -684,8 +684,22 @@ async def cb_done(cq: CallbackQuery):
     await cq.message.edit_reply_markup(reply_markup=None)
 
 
+async def health_server():
+    from aiohttp import web
+    port = int(os.environ.get("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="OK"))
+    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Health server on port {port}")
+
+
 async def main():
     log.info("Bot starting...")
+    await health_server()
     await dp.start_polling(bot)
 
 
