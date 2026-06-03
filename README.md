@@ -1,61 +1,61 @@
 # ZIP Deobfuscator Bot
 
-Production Telegram bot that accepts a `.zip`, decodes obfuscated or encoded text files inside it, and returns a clean zip while preserving folder structure.
+Production Telegram bot for Render web service deployment. It runs as a web service, starts an aiohttp health server on `$PORT`, polls Telegram, accepts `.zip` files, decodes supported obfuscation in isolated per-file processes, and sends the decoded zip back automatically.
 
-## What was fixed
+## Deploy on Render
 
-The bot now has hard per-file decoder isolation. A bad file can no longer freeze the full job for hours. Each text file is decoded in a separate process and is terminated after `FILE_TIMEOUT_SECONDS`. If one file times out, the original file is kept, the report notes it, and the bot continues to the next file.
+1. Create a new GitHub repository and upload these files.
+2. In Render, create a new Blueprint or Web Service from the repo.
+3. Use Docker runtime.
+4. Add environment variable `BOT_TOKEN` from BotFather.
+5. Deploy.
+
+The service exposes:
+
+- `/`
+- `/health`
+- `/status`
+
+## Important environment variables
+
+- `BOT_TOKEN`: Telegram bot token.
+- `MAX_ZIP_MB`: maximum Telegram zip input size, default `50`.
+- `MAX_UNCOMPRESSED_MB`: maximum total unzipped input size, default `250`.
+- `MAX_FILES`: maximum files inside a zip, default `1200`.
+- `FILE_TIMEOUT_SECONDS`: hard timeout for each file decoder process, default `22`.
+- `TOTAL_JOB_TIMEOUT_SECONDS`: whole job timeout, default `1200`.
+- `TELEGRAM_UPLOAD_LIMIT_MB`: output zip split target, default `48`.
+- `MAX_CONCURRENT_JOBS`: concurrent zip jobs, default `1`.
 
 ## Supported decoding
 
-- JavaScript `_0x` deobfuscation with external tools for safe-sized files and regex fallback
-- JavaScript `eval()`, `Function()`, `atob()`, `Buffer.from(..., 'base64')`
-- Python `marshal.loads`, `exec(compile(...))`, `exec('\x..')`
-- Base64, chunked Base64, hex strings, `\x` escapes
-- URI percent-encoding, HTML entities, Unicode escapes, octal escapes
-- JavaScript string escapes
-- JSON fields containing Base64
+- JavaScript `_0x` string-array obfuscation
+- JavaScript `eval`, `Function`, `setTimeout` string wrappers
+- JavaScript `atob` and `Buffer.from(..., "base64")`
+- Dean Edwards style packed JavaScript capture
+- Optional external JavaScript deobfuscation through Node CLI tools installed in Docker
+- JSFuck
+- Brainfuck
+- PHP `eval(base64_decode(...))`, `assert(base64_decode(...))`, `gzinflate(base64_decode(...))`, `str_rot13`
+- Python marshal code object disassembly from base64 or hex payloads
+- JSON base64 fields
+- Raw base64 and URL-safe base64
+- gzip and zlib payloads
+- Hex blobs and `\x..` style strings
+- Unicode, octal, and common string escapes
+- URL encoding
+- HTML entities
 - ROT13
-- JSFuck using Node.js when available
-- Brainfuck with a step cap
-- PHP `eval(base64_decode(...))` and `gzinflate(base64_decode(...))`
-- String reversal
+- Reversed code strings
 - Single-byte XOR
+- JavaScript beautifying
 
-## Deploy to Render as a web service
+## Reliability fixes in this build
 
-1. Push the files to GitHub.
-2. In Render, create a Blueprint or Web Service from the repo.
-3. Render reads `render.yaml` and builds the Docker web service.
-4. Set `BOT_TOKEN` from BotFather.
-5. Deploy.
-
-This is a Render web service, not a worker. The bot starts an `aiohttp` health server on `$PORT` and uses Telegram polling.
-
-## Environment variables
-
-| Name | Default | Purpose |
-| --- | --- | --- |
-| `BOT_TOKEN` | required | Telegram bot token from BotFather |
-| `MAX_ZIP_MB` | `50` | Maximum uploaded zip size |
-| `MAX_UNCOMPRESSED_MB` | `250` | Zip-bomb protection limit |
-| `MAX_FILES` | `800` | Maximum files per archive |
-| `FILE_TIMEOUT_SECONDS` | `18` | Hard timeout per text file |
-| `TOTAL_JOB_TIMEOUT_SECONDS` | `900` | Whole job timeout |
-| `MAX_CONCURRENT_JOBS` | `1` | Keeps free-tier CPU stable |
-| `MAX_EXTERNAL_JS_BYTES` | `350000` | Maximum file size for external JS deobfuscators |
-| `MAX_BEAUTIFY_BYTES` | `1000000` | Maximum JS size for beautifier |
-| `MAX_DECODE_TEXT_BYTES` | `6000000` | Maximum text file size to decode |
-
-## Local run
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-npm install -g @relative/synchrony deobfuscator javascript-obfuscator
-export BOT_TOKEN=123456:your_token
-python bot.py
-```
-
-Open the bot in Telegram, send `/start`, upload a zip, and tap **Decode it**.
+- The bot processes immediately after upload and does not depend on a callback button before starting.
+- Every file decode runs in a separate process with a hard timeout.
+- The final output is written to disk and sent using `FSInputFile`, not a huge in-memory Telegram upload.
+- Telegram send operations have retries and long request timeouts.
+- If the decoded zip is larger than the Telegram upload target, it is split into multiple zip parts.
+- Every result zip includes `DECODE_REPORT.txt`.
+- If processing fails, the bot still sends a failure report instead of silently hanging.

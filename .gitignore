@@ -1,13 +1,6 @@
+.env
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
-env/
-.env
-.DS_Store
-*.log
+/tmp/
+zip_deobfuscator_jobs/
 *.zip
-!sample/*.zip
-.idea/
-.vscode/

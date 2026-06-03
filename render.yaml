@@ -7,10 +7,12 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: MAX_ZIP_MB
-        value: "50"
+        value: 50
+      - key: MAX_UNCOMPRESSED_MB
+        value: 250
       - key: FILE_TIMEOUT_SECONDS
-        value: "18"
+        value: 22
       - key: TOTAL_JOB_TIMEOUT_SECONDS
-        value: "900"
-      - key: MAX_CONCURRENT_JOBS
-        value: "1"
+        value: 1200
+      - key: TELEGRAM_UPLOAD_LIMIT_MB
+        value: 48
